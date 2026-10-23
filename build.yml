@@ -1,0 +1,214 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/example/nettest
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "NetTest"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.nettest"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.nettest"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <application
+                  android:label="Net Test"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/nettest/MainActivity.kt <<'EOF'
+          package com.example.nettest
+
+          import android.app.Activity
+          import android.content.Context
+          import android.net.ConnectivityManager
+          import android.net.Network
+          import android.net.NetworkCapabilities
+          import android.net.NetworkRequest
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.net.URL
+          import javax.net.ssl.HttpsURLConnection
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private lateinit var out: TextView
+              private val log = StringBuilder()
+
+              private fun say(s: String) {
+                  log.append(s).append("\n")
+                  runOnUiThread { out.text = log.toString() }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 96, 32, 32)
+                  }
+                  val btn1 = Button(this).apply { text = "1. Check dual-WiFi support" }
+                  val btn2 = Button(this).apply { text = "2. Test WiFi + mobile data together" }
+                  val btnClear = Button(this).apply { text = "Clear" }
+                  out = TextView(this).apply {
+                      textSize = 14f
+                      setTextIsSelectable(true)
+                  }
+                  val scroll = ScrollView(this).apply { addView(out) }
+                  root.addView(btn1)
+                  root.addView(btn2)
+                  root.addView(btnClear)
+                  root.addView(scroll)
+                  setContentView(root)
+                  btn1.setOnClickListener { checkSupport() }
+                  btn2.setOnClickListener { testBoth() }
+                  btnClear.setOnClickListener { log.clear(); out.text = "" }
+              }
+
+              private fun checkSupport() {
+                  say("--- Support check ---")
+                  say("${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+                  val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                  try {
+                      if (Build.VERSION.SDK_INT >= 31) {
+                          say("Dual WiFi (local-only): ${wifi.isStaConcurrencyForLocalOnlyConnectionsSupported}")
+                      } else {
+                          say("Dual WiFi (local-only): needs Android 12+")
+                      }
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          val multi = wifi.isStaConcurrencyForMultiInternetSupported
+                          say("Dual WiFi for internet (multi-internet): $multi")
+                          say(if (multi) "=> Two WiFi connections look SUPPORTED." else "=> Two WiFi connections NOT supported. Use WiFi + mobile data.")
+                      } else {
+                          say("Dual WiFi for internet: needs Android 14+")
+                      }
+                  } catch (e: Exception) {
+                      say("Check failed: ${e.message}")
+                  }
+                  say("")
+              }
+
+              private fun testBoth() {
+                  say("--- WiFi + mobile data test ---")
+                  say("Keep WiFi AND mobile data switched on.")
+                  testNetwork("WiFi", NetworkCapabilities.TRANSPORT_WIFI)
+                  testNetwork("Mobile data", NetworkCapabilities.TRANSPORT_CELLULAR)
+              }
+
+              private fun testNetwork(label: String, transport: Int) {
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val request = NetworkRequest.Builder()
+                      .addTransportType(transport)
+                      .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                      .build()
+                  cm.requestNetwork(request, object : ConnectivityManager.NetworkCallback() {
+                      override fun onAvailable(network: Network) {
+                          say("$label: network available, fetching public IP...")
+                          thread {
+                              try {
+                                  val t0 = System.currentTimeMillis()
+                                  val c = network.openConnection(URL("https://api.ipify.org")) as HttpsURLConnection
+                                  c.connectTimeout = 8000
+                                  c.readTimeout = 8000
+                                  val ip = c.inputStream.bufferedReader().readText()
+                                  say("$label: public IP $ip (${System.currentTimeMillis() - t0} ms)")
+                                  say("(Two DIFFERENT IPs = both links work at once.)")
+                              } catch (e: Exception) {
+                                  say("$label: request failed: ${e.message}")
+                              }
+                          }
+                      }
+                      override fun onUnavailable() {
+                          say("$label: not available (is it switched on?)")
+                      }
+                  }, 15000)
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Net Test build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
